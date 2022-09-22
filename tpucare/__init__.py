@@ -20,7 +20,7 @@ def call(cmd: str) -> str:
 PROJECT = call("gcloud config get project")
 GLOBAL_DICT = {}
 CACHE_TIME = 10
-LOG_LEVEL = logging.INFO
+LOG_LEVEL = logging.DEBUG
 Context = typing.TypeVar("Context")
 All = typing.Literal["all"]
 SliceIndex = typing.Union[All, int]
@@ -47,7 +47,7 @@ def exec_command(repository: str, wandb_key: typing.Optional[str] = None, branch
     script.append(f"cd {path}")
     if wandb_key is not None:
         script.append("python3 -m pip install wandb")
-        script.append(f"/home/ubuntu/.local/bin/wandb login {wandb_key}")
+        script.append(f"/home/ohadr/.local/bin/wandb login {wandb_key}")
     script.extend([setup_command, f'screen -dmS model bash -c "cd {path} ; {run_command}"'])
     return ' && '.join(script)
 
@@ -56,15 +56,17 @@ def send_to_tpu(host: str, zone: str, filename_on_tpu: str, command: str, worker
     with tempfile.NamedTemporaryFile(mode='w+') as f:
         f.write(command)
         f.flush()
-        os.system(f"gcloud alpha compute tpus tpu-vm scp {f.name} ubuntu@{host}:~/{filename_on_tpu} --zone {zone} "
+        os.system(f"gcloud alpha compute tpus tpu-vm scp {f.name} ohadr@{host}:~/{filename_on_tpu} --zone {zone} "
                   f"--worker {worker}")
-
+def send_file_to_tpu(host: str, zone: str, filename_on_tpu: str, filename_on_local: str, worker: SliceIndex = 0):
+    os.system(f"gcloud alpha compute tpus tpu-vm scp {filename_on_local} ohadr@{host}:~/{filename_on_tpu} --zone {zone} "
+              f"--worker {worker}")
 
 def exec_on_tpu(host: str, zone: str, command: str, worker: SliceIndex = 0):
     log(f"running '{command}' ...", log_level=logging.DEBUG)
     start_time = time.time()
     ret = subprocess.call(
-            ["gcloud", "alpha", "compute", "tpus", "tpu-vm", "ssh", f"ubuntu@{host}", f"--zone", zone, "--command",
+            ["gcloud", "alpha", "compute", "tpus", "tpu-vm", "ssh", f"ohadr@{host}", f"--zone", zone, "--command",
              command, "--worker", str(worker)])
     if not ret:
         log(f"Finished running '{command}' after {time.time() - start_time:.1f}s", log_level=logging.DEBUG)
@@ -131,8 +133,8 @@ def delete_all(prefix: str, zone: str):
 def create_tpu(host: str, zone: str, tpu_version: int, preemptible: bool, service_account: str,
                semaphore: typing.Optional[typing.ContextManager], slices: int = 1):
     with semaphore:
-        os.system(f'while ! gcloud alpha compute tpus tpu-vm create {host} --service-account {service_account} '
-                  f'--zone {zone} --accelerator-type v{tpu_version}-{slices * 8} --version v2-alpha '
+        os.system(f'while ! gcloud alpha compute tpus tpu-vm create {host} '
+                  f'--zone {zone} --accelerator-type v{tpu_version}-{slices * 8} --version tpu-vm-base '
                   f'{"--preemptible" * preemptible}; do echo; done')
 
 
@@ -153,7 +155,8 @@ def get_name(fn: typing.Callable, base: str):
 def start_single(host: str, tpu_version: int, zone: str, preemptible: bool, service_account: str, slices: int,
                  start_fn: typing.Callable[[Context, SliceIndex], None],
                  creation_callback: typing.Callable[[str, typing.Optional[Context]], Context],
-                 creation_semaphore: typing.Optional[typing.ContextManager] = None, all_workers: bool = False):
+                 creation_semaphore: typing.Optional[typing.ContextManager] = None, all_workers: bool = False,
+                 kill_on_error: bool = False):
     if creation_semaphore is None:
         creation_semaphore = nullcontext()
 
@@ -164,8 +167,10 @@ def start_single(host: str, tpu_version: int, zone: str, preemptible: bool, serv
 
     while True:
         try:
+            time.sleep(3)
             log("Recreating TPU", log_level=logging.DEBUG)
-            recreate(host, zone, tpu_version, preemptible, service_account, slices, creation_semaphore)
+            if host not in tpu_names(zone, no_filter=True):
+                recreate(host, zone, tpu_version, preemptible, service_account, slices, creation_semaphore)
             log(f"TPU Created. Calling {creation_callback_name}.", log_level=logging.INFO)
             ctx = creation_callback(host, ctx)
             log(f"Callback returned. Launching {start_fn_name}", log_level=logging.DEBUG)
@@ -191,12 +196,13 @@ def start_single(host: str, tpu_version: int, zone: str, preemptible: bool, serv
                 for t in threads:
                     if t.is_alive():
                         os.kill(t.pid, signal.SIGINT)
-                time.sleep(0.1)
+                time.sleep(0.5)
             log("Sent SIGINT to all workers", log_level=logging.INFO)
         except KeyboardInterrupt:
-            log(f"{host} - {datetime.datetime.now()}: KeyboardInterrupt received. Killing TPU, then self.",
-                log_level=logging.WARN)
-            delete_one_tpu("", host, zone, False)
+            if kill_on_error:
+                log(f"{host} - {datetime.datetime.now()}: KeyboardInterrupt received. Killing TPU, then self.",
+                    log_level=logging.WARN)
+                delete_one_tpu("", host, zone, False)
             return
 
 
